@@ -17,6 +17,7 @@ import math
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,6 +39,7 @@ from .configuration_llama4 import Llama4Config, Llama4TextConfig
 
 
 logger = logging.get_logger(__name__)
+_OFFLINE_QUANT_COMPATIBLE = os.environ.get("OFFLINE_QUANT_COMPATIBLE", "0") == "1"
 
 
 class Llama4TextExperts(nn.Module):
@@ -133,7 +135,10 @@ class Llama4TextMoe(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.hidden_dim = config.hidden_size
         self.num_experts = config.num_local_experts
-        self.experts = Llama4TextExperts(config)
+        if _OFFLINE_QUANT_COMPATIBLE:
+            self.experts = nn.ModuleList([Llama4TextMLP(config) for _ in range(self.num_experts)])
+        else:
+            self.experts = Llama4TextExperts(config)
         self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
         self.shared_expert = Llama4TextMLP(config)
 
@@ -151,6 +156,15 @@ class Llama4TextMoe(nn.Module):
         routed_in = hidden_states.repeat(self.num_experts, 1)
         routed_in = routed_in * router_scores.reshape(-1, 1)
         routed_out = self.experts(routed_in)
+
+        expert_routed_out_list = []
+        if _OFFLINE_QUANT_COMPATIBLE:
+            routed_in = routed_in.reshape(self.num_experts, -1, routed_in.shape[-1])
+            for expert_idx in range(self.num_experts):
+                expert_routed_out_list.append(self.experts[expert_idx](routed_in[expert_idx]))
+            routed_out = torch.cat(expert_routed_out_list, dim=0)
+        else:
+            routed_out = self.experts(routed_in)
 
         out = self.shared_expert(hidden_states)
         out.add_(routed_out.reshape(self.num_experts, -1, self.hidden_dim).sum(dim=0))
